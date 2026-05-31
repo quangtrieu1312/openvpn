@@ -32,6 +32,7 @@
 #include "multi.h"
 #include <inttypes.h>
 #include "forward.h"
+#include "fdmisc.h"
 
 #include "memdbg.h"
 
@@ -277,6 +278,83 @@ multi_process_io_udp_batch(struct multi_context *m, const unsigned int mpp_flags
         }
     }
 }
+
+/*
+ * Batched UDP TX path (experimental, --udp-batch-tx). On a TUN_READ event, drain
+ * several packets from the (now non-blocking) tun device; encrypt + route each
+ * through the unchanged per-packet path; capture each resulting outgoing datagram
+ * into a TX batch; then flush the batch with one syscall per same-peer run
+ * (UDP_SEGMENT GSO + sendmmsg fallback). The tun fd is made non-blocking on first
+ * use so the drain loop stops on EAGAIN instead of stalling the event loop.
+ *
+ * Note (experimental): batched datagrams bypass process_outgoing_link(), so
+ * shaper/TOS/link-write byte stats are not applied to them; the caller gates this
+ * path off when --shaper is set, and only data packets (not ping/TLS control,
+ * which travel via the normal pending path) take it.
+ */
+static void
+multi_process_io_tun_batch(struct multi_context *m, const unsigned int mpp_flags)
+{
+    struct context *top = &m->top;
+
+    if (!m->udp_tx_batch)
+    {
+        m->udp_tx_batch = udp_tx_batch_alloc(top->options.udp_batch_tx, &top->c2.frame);
+        if (!m->udp_tx_batch || !top->c1.tuntap)
+        {
+            /* allocation failed: fall back to a single read for this event */
+            read_incoming_tun(top);
+            if (!IS_SIG(top))
+            {
+                multi_process_incoming_tun(m, mpp_flags);
+            }
+            return;
+        }
+        set_nonblock(top->c1.tuntap->fd);
+    }
+
+    struct link_socket *ls = top->c2.link_socket;
+    int staged = 0;
+
+    for (int j = 0; j < m->udp_tx_batch->cap && !IS_SIG(top); ++j)
+    {
+        read_incoming_tun(top);
+        if (IS_SIG(top))
+        {
+            break;
+        }
+        if (BLEN(&top->c2.buf) <= 0)
+        {
+            break;      /* tun drained (EAGAIN) */
+        }
+
+        multi_process_incoming_tun(m, mpp_flags);
+
+        if (m->pending)
+        {
+            struct context *c = &m->pending->context;
+            if (LINK_OUT(c)
+                && link_socket_actual_defined(c->c2.to_link_addr)
+                && udp_tx_batch_add(m->udp_tx_batch, &c->c2.to_link, c->c2.to_link_addr))
+            {
+                c->c2.to_link.len = 0;     /* consumed into the batch */
+                staged++;
+                multi_set_pending(m, NULL);
+            }
+            else
+            {
+                /* batch full, or output is to_tun rather than to_link: leave it
+                 * pending for the normal loop and stop draining. */
+                break;
+            }
+        }
+    }
+
+    if (staged > 0)
+    {
+        udp_tx_batch_flush(ls, m->udp_tx_batch);
+    }
+}
 #endif /* TARGET_LINUX */
 
 /*
@@ -357,10 +435,21 @@ multi_process_io_udp(struct multi_context *m)
     /* Incoming data on TUN device */
     else if (status & TUN_READ)
     {
-        read_incoming_tun(&m->top);
-        if (!IS_SIG(&m->top))
+#if defined(TARGET_LINUX)
+        if (m->top.options.udp_batch_tx > 0
+            && proto_is_udp(m->top.c2.link_socket->info.proto)
+            && !m->top.options.shaper)
         {
-            multi_process_incoming_tun(m, mpp_flags);
+            multi_process_io_tun_batch(m, mpp_flags);
+        }
+        else
+#endif
+        {
+            read_incoming_tun(&m->top);
+            if (!IS_SIG(&m->top))
+            {
+                multi_process_incoming_tun(m, mpp_flags);
+            }
         }
     }
 #ifdef ENABLE_ASYNC_PUSH

@@ -3675,6 +3675,241 @@ link_socket_read_udp_posix_recvmmsg(struct link_socket *sock,
     return k;
 }
 
+/*
+ * ---- TX batching (sendmmsg + UDP_SEGMENT / GSO) ----
+ */
+
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+
+struct udp_tx_batch *
+udp_tx_batch_alloc(int cap, const struct frame *frame)
+{
+    if (cap <= 0 || !frame)
+    {
+        return NULL;
+    }
+    if (cap > 1024)
+    {
+        cap = 1024;
+    }
+
+    struct udp_tx_batch *b;
+    ALLOC_OBJ_CLEAR(b, struct udp_tx_batch);
+    b->cap = cap;
+    b->n = 0;
+    b->headroom = FRAME_HEADROOM_ADJ(frame, FRAME_HEADROOM_MARKER_READ_LINK);
+
+    /* arena holds up to cap datagrams of full EXPANDED_SIZE each */
+    const int dgram_max = EXPANDED_SIZE(frame);
+    b->arena = alloc_buf((size_t) cap * (size_t) dgram_max + 256);
+    ALLOC_ARRAY_CLEAR(b->off, int, cap);
+    ALLOC_ARRAY_CLEAR(b->len, int, cap);
+    ALLOC_ARRAY_CLEAR(b->to, struct link_socket_actual, cap);
+    ALLOC_ARRAY_CLEAR(b->hdrs, struct mmsghdr, cap);
+    ALLOC_ARRAY_CLEAR(b->iovs, struct iovec, cap);
+    return b;
+}
+
+void
+udp_tx_batch_free(struct udp_tx_batch *b)
+{
+    if (!b)
+    {
+        return;
+    }
+    free_buf(&b->arena);
+    free(b->off);
+    free(b->len);
+    free(b->to);
+    free(b->hdrs);
+    free(b->iovs);
+    free(b);
+}
+
+void
+udp_tx_batch_reset(struct udp_tx_batch *b)
+{
+    b->n = 0;
+    b->arena.len = 0;
+    b->arena.offset = 0;
+}
+
+bool
+udp_tx_batch_add(struct udp_tx_batch *b, const struct buffer *buf,
+                 const struct link_socket_actual *to)
+{
+    if (b->n >= b->cap)
+    {
+        return false;
+    }
+    const int len = BLEN(buf);
+    if (len <= 0)
+    {
+        return false;
+    }
+    /* arena is a flat byte region we append into; track our own write cursor in
+     * arena.len (reset by udp_tx_batch_reset). */
+    const int cursor = b->arena.len;
+    if (cursor + len > b->arena.capacity)
+    {
+        return false;
+    }
+    memcpy(b->arena.data + cursor, BPTR(buf), (size_t) len);
+    b->off[b->n] = cursor;
+    b->len[b->n] = len;
+    b->to[b->n] = *to;
+    b->arena.len = cursor + len;
+    b->n++;
+    return true;
+}
+
+static void
+udp_tx_batch_probe_gso(struct link_socket *sock, struct udp_tx_batch *b)
+{
+    /* UDP_SEGMENT is set per-sendmsg via cmsg; there's no persistent socket
+     * state to probe, but keep the lazy-flag shape symmetric with RX. We treat
+     * GSO as available on Linux and fall back per-call if a send returns
+     * EINVAL/ENOTSUP. */
+    b->gso_tried = true;
+    b->gso_ok = true;
+    (void) sock;
+}
+
+/* send one same-destination run [i0, i1) as a single GSO sendmsg.
+ * Precondition: datagrams i0..i1-1 are contiguous in the arena, all of size
+ * gso_size except possibly the last which may be smaller. Returns bytes sent or
+ * -1 (caller falls back to sendmmsg for this run). */
+static int
+udp_tx_gso_send(struct link_socket *sock, struct udp_tx_batch *b,
+                int i0, int i1, int gso_size)
+{
+    struct iovec iov;
+    struct msghdr mh;
+    uint8_t ctrl[CMSG_SPACE(sizeof(uint16_t))];
+    const struct link_socket_actual *to = &b->to[i0];
+    const int total = (b->off[i1 - 1] + b->len[i1 - 1]) - b->off[i0];
+
+    memset(&mh, 0, sizeof(mh));
+    iov.iov_base = b->arena.data + b->off[i0];
+    iov.iov_len = total;
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_name = (void *) &to->dest.addr.sa;
+    mh.msg_namelen = af_addr_size(to->dest.addr.sa.sa_family);
+    mh.msg_control = ctrl;
+    mh.msg_controllen = CMSG_SPACE(sizeof(uint16_t));
+
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+    cm->cmsg_level = SOL_UDP;
+    cm->cmsg_type = UDP_SEGMENT;
+    cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    uint16_t seg = (uint16_t) gso_size;
+    memcpy(CMSG_DATA(cm), &seg, sizeof(seg));
+
+    ssize_t r = sendmsg(sock->sd, &mh, 0);
+    if (r < 0)
+    {
+        return -1;
+    }
+    return (int) r;
+}
+
+int
+udp_tx_batch_flush(struct link_socket *sock, struct udp_tx_batch *b)
+{
+    if (b->n <= 0)
+    {
+        return 0;
+    }
+    if (!b->gso_tried)
+    {
+        udp_tx_batch_probe_gso(sock, b);
+    }
+
+    int sent_bytes = 0;
+    int i = 0;
+    while (i < b->n)
+    {
+        /* build a same-destination, equal-size run for GSO: all entries equal
+         * b->len[i] except possibly the final one, which may be smaller.
+         * Kernel UDP_SEGMENT limits a single GSO send to UDP_MAX_SEGMENTS (64)
+         * segments AND a total payload <= 65535 bytes, so cap the run length. */
+        const int base = b->len[i];
+        int max_segs = 64;                      /* UDP_MAX_SEGMENTS */
+        if (base > 0 && 65535 / base < max_segs)
+        {
+            max_segs = 65535 / base;            /* total-bytes ceiling */
+        }
+        if (max_segs < 1)
+        {
+            max_segs = 1;
+        }
+        int j = i + 1;
+        while (j < b->n
+               && (j - i) < max_segs
+               && link_socket_actual_match(&b->to[j], &b->to[i])
+               && b->len[j] == base)
+        {
+            j++;
+        }
+        /* optionally fold one smaller tail datagram of the same dest, if the run
+         * still has room for one more segment under the kernel limit */
+        if (j < b->n
+            && (j - i) < max_segs
+            && link_socket_actual_match(&b->to[j], &b->to[i])
+            && b->len[j] < base)
+        {
+            j++;
+        }
+
+        int run = j - i;
+        if (b->gso_ok && run >= 2)
+        {
+            int r = udp_tx_gso_send(sock, b, i, j, base);
+            if (r >= 0)
+            {
+                sent_bytes += r;
+                i = j;
+                continue;
+            }
+            /* GSO failed (e.g. EINVAL): disable and fall through to sendmmsg */
+            b->gso_ok = false;
+        }
+
+        /* sendmmsg for the (single-dest-contiguous or non-GSO) run [i, j) */
+        int cnt = 0;
+        for (int k = i; k < j; ++k)
+        {
+            struct mmsghdr *mm = &b->hdrs[cnt];
+            struct iovec *io = &b->iovs[cnt];
+            memset(mm, 0, sizeof(*mm));
+            io->iov_base = b->arena.data + b->off[k];
+            io->iov_len = b->len[k];
+            mm->msg_hdr.msg_iov = io;
+            mm->msg_hdr.msg_iovlen = 1;
+            mm->msg_hdr.msg_name = (void *) &b->to[k].dest.addr.sa;
+            mm->msg_hdr.msg_namelen = af_addr_size(b->to[k].dest.addr.sa.sa_family);
+            cnt++;
+        }
+        int s = sendmmsg(sock->sd, b->hdrs, cnt, 0);
+        if (s < 0)
+        {
+            udp_tx_batch_reset(b);
+            return -1;
+        }
+        for (int k = 0; k < s; ++k)
+        {
+            sent_bytes += (int) b->hdrs[k].msg_len;
+        }
+        i = j;
+    }
+
+    udp_tx_batch_reset(b);
+    return sent_bytes;
+}
+
 #endif /* TARGET_LINUX */
 
 #endif /* ifndef _WIN32 */

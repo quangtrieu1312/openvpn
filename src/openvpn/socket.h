@@ -1085,6 +1085,51 @@ void udp_batch_free(struct udp_batch *b);
  */
 int link_socket_read_udp_posix_recvmmsg(struct link_socket *sock,
                                         struct udp_batch *b);
+
+/*
+ * Experimental Linux UDP TX batching: accumulate several outgoing datagrams and
+ * flush them with one syscall per destination run, using UDP_SEGMENT (GSO) for
+ * same-peer equal-size runs and sendmmsg() for the remainder. On-the-wire format
+ * is unchanged (the kernel splits/sends individual datagrams).
+ */
+#define HAVE_UDP_BATCH_TX 1
+
+struct udp_tx_batch
+{
+    int n;                              /* datagrams currently staged */
+    int cap;                           /* max datagrams (from --udp-batch-tx) */
+    int headroom;                      /* arena headroom (from frame) */
+    bool gso_tried;                    /* lazy UDP_SEGMENT probe done */
+    bool gso_ok;                       /* UDP_SEGMENT usable on this socket */
+    struct buffer arena;               /* contiguous backing; datagrams appended */
+    int *off;                          /* arena offset of datagram i */
+    int *len;                          /* length of datagram i */
+    struct link_socket_actual *to;     /* destination of datagram i */
+    struct mmsghdr *hdrs;              /* sendmmsg scratch */
+    struct iovec *iovs;                /* sendmmsg scratch */
+};
+
+struct udp_tx_batch *udp_tx_batch_alloc(int cap, const struct frame *frame);
+
+void udp_tx_batch_free(struct udp_tx_batch *b);
+
+/* reset to empty (call after a flush) */
+void udp_tx_batch_reset(struct udp_tx_batch *b);
+
+/*
+ * Stage one outgoing datagram (copied into the arena). Returns true if staged,
+ * false if the batch is full or the datagram doesn't fit (caller should flush
+ * then send this one normally).
+ */
+bool udp_tx_batch_add(struct udp_tx_batch *b, const struct buffer *buf,
+                      const struct link_socket_actual *to);
+
+/*
+ * Flush all staged datagrams: same-peer equal-size runs via one sendmsg +
+ * UDP_SEGMENT; everything else via sendmmsg (or per-datagram sendmsg fallback).
+ * Returns total bytes sent (>=0), or -1 on a hard error. Resets the batch.
+ */
+int udp_tx_batch_flush(struct link_socket *sock, struct udp_tx_batch *b);
 #endif /* TARGET_LINUX */
 
 #endif

@@ -292,6 +292,9 @@ static const char usage_message[] =
     "--udp-batch-rx n : (Linux, experimental) batch UDP server receive using\n"
     "                  recvmmsg + UDP_GRO, reading up to n datagrams per syscall.\n"
     "                  0 = disabled (default).\n"
+    "--udp-batch-tx n : (Linux, experimental) batch UDP server transmit using\n"
+    "                  sendmmsg + UDP_SEGMENT (GSO), up to n datagrams per flush.\n"
+    "                  0 = disabled (default).\n"
 #if defined(TARGET_LINUX) && HAVE_DECL_SO_MARK
     "--mark value    : Mark encrypted packets being sent with value. The mark value\n"
     "                  can be matched in policy routing and packetfilter rules.\n"
@@ -1633,6 +1636,7 @@ show_settings(const struct options *o)
     SHOW_INT(rcvbuf);
     SHOW_INT(sndbuf);
     SHOW_INT(udp_batch_rx);
+    SHOW_INT(udp_batch_tx);
 #if defined(TARGET_LINUX) && HAVE_DECL_SO_MARK
     SHOW_INT(mark);
 #endif
@@ -6193,6 +6197,11 @@ add_option(struct options *options,
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
         options->udp_batch_rx = positive_atoi(p[1]);
+    }
+    else if (streq(p[0], "udp-batch-tx") && p[1] && !p[2])
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL);
+        options->udp_batch_tx = positive_atoi(p[1]);
     }
     else if (streq(p[0], "mark") && p[1] && !p[2])
     {

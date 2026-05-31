@@ -753,6 +753,8 @@ multi_uninit(struct multi_context *m)
 #if defined(TARGET_LINUX)
             udp_batch_free(m->udp_batch);
             m->udp_batch = NULL;
+            udp_tx_batch_free(m->udp_tx_batch);
+            m->udp_tx_batch = NULL;
 #endif
             m->thread_mode = MC_UNDEF;
         }

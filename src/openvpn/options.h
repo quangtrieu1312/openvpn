@@ -367,6 +367,10 @@ struct options
      * Number of datagrams to pull per recvmmsg() call; 0 = disabled. */
     int udp_batch_rx;
 
+    /* experimental (Linux): batch UDP server TX with sendmmsg + UDP_SEGMENT
+     * (GSO). Max datagrams accumulated per flush; 0 = disabled. */
+    int udp_batch_tx;
+
     /* mark value */
     int mark;
     char *bind_dev;

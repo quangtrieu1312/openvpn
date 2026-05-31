@@ -149,7 +149,8 @@ struct multi_instance {
  * page describes the role the structure plays when OpenVPN is running in
  * server-mode.
  */
-struct udp_batch; /* experimental UDP RX batching, see socket.h (Linux only) */
+struct udp_batch;    /* experimental UDP RX batching, see socket.h (Linux only) */
+struct udp_tx_batch; /* experimental UDP TX batching, see socket.h (Linux only) */
 
 struct multi_context {
 #define MC_UNDEF                      0
@@ -217,6 +218,9 @@ struct multi_context {
     /* experimental recvmmsg + UDP_GRO RX batch container; NULL when the
      * --udp-batch-rx optimization is disabled. Allocated lazily on first use. */
     struct udp_batch *udp_batch;
+    /* experimental sendmmsg + UDP_SEGMENT TX batch container; NULL when the
+     * --udp-batch-tx optimization is disabled. Allocated lazily on first use. */
+    struct udp_tx_batch *udp_tx_batch;
 #endif
 };
 
