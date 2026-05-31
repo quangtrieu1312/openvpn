@@ -73,10 +73,19 @@ iperf3 -4 -c <target> -P 8 -t 15 -R
 # UDP variants add:  -u -b 3000M     (offered rate well above capacity, to stress)
 ```
 
-`-P 8` (8 parallel streams) is used to push enough aggregate load to saturate the
-**single server core**. Server CPU% below is the openvpn process (`utime+stime`,
-single-threaded ⇒ **100% = one core fully saturated = the server is the
-bottleneck**), sampled for ~9 s mid-run directly on test-1.
+`-P 8` (8 parallel streams) is used to push enough aggregate load to drive the
+server's CPU to its ceiling.
+
+**How to read the CPU% column:** it is the openvpn **process** CPU as `top`/`pidstat`
+report it — `(Δutime + Δstime) / wall`, where **one core = 100%** (CLK_TCK 100,
+sampled ~9 s mid-run directly on test-1). It is **not** normalized to the box's two
+cores (that scale would be 200%). Because the OpenVPN 2.5 data path is
+**single-threaded**, the relevant ceiling is **100% = one core**; the second core
+cannot help it. So **~90% means the openvpn thread is using ~0.9 of one core** —
+near-saturated, with the remaining ~10% spent blocked in syscalls/`epoll_wait`, not
+idle headroom. This is what makes the stock-vs-batch comparison fair: both are
+pinned at the same one-core ceiling, so higher throughput at equal CPU is a real
+per-packet efficiency gain.
 
 ## Results
 
@@ -86,7 +95,8 @@ limit.
 
 ### TCP throughput (Mbit/s, sum of 8 streams) + server CPU%
 
-Server core is ~90–93% in both stock and batch → a fair, CPU-bound comparison.
+Server openvpn process at ~90–93% of **one core** in both stock and batch (the
+single-threaded ceiling is 100%) → a fair, CPU-bound comparison.
 
 | scenario (UP=RX, DOWN=TX) | stock | cpu | batch | cpu | Δ |
 |---------------------------|------:|----:|------:|----:|----:|
@@ -97,8 +107,9 @@ Server core is ~90–93% in both stock and batch → a fair, CPU-bound compariso
 | mixed UP                  |   215 | 92% |   426 | 92% | **+98%** |
 | mixed DOWN                |   156 | 92% |   175 | 92% | +12% |
 
-Notable: 1-client UP reaches 491 Mbit/s at only **73%** CPU (vs stock 367 @ 90%) —
-batching does the same work for less CPU; the 2-client cases (server fully loaded)
+Notable: 1-client UP reaches 491 Mbit/s at only **73%** of one core (vs stock 367
+@ 90%) — batching does the same work for less CPU; the 2-client cases (server
+near-saturated at ~one core)
 roughly **double** throughput.
 
 ### UDP loss @ `-b 3000M` offered (lower = better)
