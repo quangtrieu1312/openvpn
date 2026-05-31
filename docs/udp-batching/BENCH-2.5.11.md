@@ -18,21 +18,28 @@ Conditions: **direct** (no VPN) · **stock** (pristine v2.5.11, separate build,
 rejects `--udp-batch-rx`) · **batch** (`--udp-batch-rx 32`, logs `UDP_GRO enabled`).
 Each: 1-up, 1-down, 2-up, 2-down, 1up+1down — in TCP and UDP, iperf3 `-4`.
 
-## Syscall counts (strace -c, server, 2-client UDP upload, MTU 1500)
-STOCK baseline captured cleanly — confirms the per-datagram receive model:
+## Syscall counts (strace -c, server, ~13 s, 2-client UDP upload @ `-l 300 -b 1000M`)
+Clean A/B capture. NOTE the two runs did **not** carry equal volume in the window
+(batch forwarded ~3× the data — see `write` = per-packet tun forwards), so compare
+**per-datagram behaviour**, not raw totals:
 
-| syscall    | STOCK (12s) |
-|------------|------------:|
-| `poll`     | 117,887     |
-| `recvfrom` | 58,918      |
-| `recvmmsg` | 0           |
+| syscall       | STOCK   | BATCH (--udp-batch-rx 32) |
+|---------------|--------:|--------------------------:|
+| `write` (tun) | 46,275  | 146,756                   |
+| `recvfrom`    | 46,275  | 0                         |
+| `recvmmsg`    | 0       | 2,307                     |
+| `poll`        | 92,591  | 2,351                     |
 
-The matching BATCH strace was **not** captured: the testbed lost connectivity
-mid-run. So the direct `recvfrom`→`recvmmsg` syscall-collapse measurement on the
-batched server is still PENDING a re-run. (That batching is active is confirmed
-independently: the server logs `UDP batch RX: UDP_GRO enabled`, and the
-throughput gains below match an RX-only optimization.) Do not cite a batched
-syscall count until it is actually measured.
+Reading (verified from the raw strace files):
+- **STOCK = exactly one `recvfrom` per forwarded datagram** (46,275 / 46,275) and
+  two `poll`s per datagram — the per-packet receive model.
+- **BATCH eliminates `recvfrom` entirely** (→ 0), replaced by `recvmmsg`; with
+  UDP_GRO each call pulls **~64 datagrams** (146,756 forwarded / 2,307 recvmmsg).
+- **`poll` collapses ~39×** (92,591 → 2,351), and per forwarded datagram it drops
+  ~80× (2.0 → 0.016). This is the syscall-level signature of the win: far fewer
+  receive calls and event-loop wakeups per packet, plus GRO amortizing kernel UDP
+  stack traversal — consistent with the +15–40% receive throughput below. No
+  decrypt/replay errors. (`UDP batch RX: UDP_GRO enabled` is logged at startup.)
 
 ## Throughput — server RX path = client UPLOAD (Mbit/s, iperf3 receiver)
 RX batching only touches the server receive path, so upload is the signal;
@@ -62,7 +69,8 @@ UDP 1 Gbit/s @ ~0% loss at both MTUs (testbed is not the bottleneck).
 ## Takeaway
 RX batching raises server receive-side throughput ~+15–40% (cleanest on
 single-client upload, +20–37%) while download is unchanged — the expected
-signature of an RX-only optimization on the non-DCO userspace path. The matching
-syscall-collapse count on the batched server still needs a clean capture (see
-above). A few cells hit transient iperf3 races (marked n/a in the raw log) and
-are excluded.
+signature of an RX-only optimization on the non-DCO userspace path. At the
+syscall level: per-datagram `recvfrom` is eliminated in favour of `recvmmsg`
+(~64 datagrams/call under UDP_GRO) and `poll` drops ~39× — far fewer receive
+calls and wakeups per packet. A few cells hit transient iperf3 races (marked n/a
+in the raw log) and are excluded.
