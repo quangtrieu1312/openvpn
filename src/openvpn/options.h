@@ -363,6 +363,10 @@ struct options
     int rcvbuf;
     int sndbuf;
 
+    /* experimental (Linux): batch UDP server RX with recvmmsg + UDP_GRO.
+     * Number of datagrams to pull per recvmmsg() call; 0 = disabled. */
+    int udp_batch_rx;
+
     /* mark value */
     int mark;
     char *bind_dev;

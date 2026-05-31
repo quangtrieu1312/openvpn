@@ -289,6 +289,9 @@ static const char usage_message[] =
     "                  or --fragment max value, whichever is lower.\n"
     "--sndbuf size   : Set the TCP/UDP send buffer size.\n"
     "--rcvbuf size   : Set the TCP/UDP receive buffer size.\n"
+    "--udp-batch-rx n : (Linux, experimental) batch UDP server receive using\n"
+    "                  recvmmsg + UDP_GRO, reading up to n datagrams per syscall.\n"
+    "                  0 = disabled (default).\n"
 #if defined(TARGET_LINUX) && HAVE_DECL_SO_MARK
     "--mark value    : Mark encrypted packets being sent with value. The mark value\n"
     "                  can be matched in policy routing and packetfilter rules.\n"
@@ -1629,6 +1632,7 @@ show_settings(const struct options *o)
     SHOW_BOOL(occ);
     SHOW_INT(rcvbuf);
     SHOW_INT(sndbuf);
+    SHOW_INT(udp_batch_rx);
 #if defined(TARGET_LINUX) && HAVE_DECL_SO_MARK
     SHOW_INT(mark);
 #endif
@@ -6184,6 +6188,11 @@ add_option(struct options *options,
     {
         VERIFY_PERMISSION(OPT_P_SOCKBUF);
         options->sndbuf = positive_atoi(p[1]);
+    }
+    else if (streq(p[0], "udp-batch-rx") && p[1] && !p[2])
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL);
+        options->udp_batch_rx = positive_atoi(p[1]);
     }
     else if (streq(p[0], "mark") && p[1] && !p[2])
     {

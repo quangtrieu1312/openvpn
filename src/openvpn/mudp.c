@@ -165,6 +165,120 @@ multi_process_outgoing_link(struct multi_context *m, const unsigned int mpp_flag
     }
 }
 
+#if defined(TARGET_LINUX)
+/*
+ * Feed a single received datagram (already placed in m->top.c2.buf with the
+ * source address in m->top.c2.from) through the demux + decrypt path, then
+ * synchronously flush this instance's deferred output.
+ *
+ * The flush is required: multi_process_incoming_link() bails out early if
+ * m->pending is already set ("if (m->pending) return true;"), so without
+ * draining the previous packet's output here the next packet in the batch
+ * would be dropped. The drain is bounded because process_outgoing_tun() /
+ * process_outgoing_link() always reset their buffers, and multi_process_post()
+ * clears m->pending once no output remains (and multi_close_instance() clears
+ * it too, so this is safe across a per-instance signal/close).
+ */
+static void
+multi_process_one_packet(struct multi_context *m, const unsigned int mpp_flags)
+{
+    if (IS_SIG(&m->top))
+    {
+        return;
+    }
+
+    multi_process_incoming_link(m, NULL, mpp_flags);
+
+    while (m->pending && !IS_SIG(&m->top))
+    {
+        struct context *c = &m->pending->context;
+        if (TUN_OUT(c))
+        {
+            multi_process_outgoing_tun(m, mpp_flags);
+        }
+        else if (LINK_OUT(c))
+        {
+            multi_process_outgoing_link(m, mpp_flags);
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
+/*
+ * Batched UDP read path (experimental, --udp-batch-rx). Pull up to N datagrams
+ * in one recvmmsg() call, optionally split kernel UDP_GRO super-buffers back
+ * into segments, and feed each through the unchanged per-packet path. The whole
+ * batch is processed within a single io_wait() cycle so the syscall savings are
+ * not lost to one epoll_wait() per packet.
+ */
+static void
+multi_process_io_udp_batch(struct multi_context *m, const unsigned int mpp_flags)
+{
+    struct context *top = &m->top;
+
+    if (!m->udp_batch)
+    {
+        m->udp_batch = udp_batch_alloc(top->options.udp_batch_rx, &top->c2.frame);
+        if (!m->udp_batch)
+        {
+            /* allocation failed: fall back to a single read for this event */
+            read_incoming_link(top);
+            if (!IS_SIG(top))
+            {
+                multi_process_incoming_link(m, NULL, mpp_flags);
+            }
+            return;
+        }
+    }
+
+    int k = link_socket_read_udp_posix_recvmmsg(top->c2.link_socket, m->udp_batch);
+    if (k <= 0)
+    {
+        return;
+    }
+
+    for (int i = 0; i < k && !IS_SIG(top); ++i)
+    {
+        struct udp_batch_slot *s = &m->udp_batch->slots[i];
+
+        if (s->buf.len <= 0)
+        {
+            continue;
+        }
+
+        if (s->gso_size > 0 && s->gso_size < s->buf.len)
+        {
+            /* GRO super-buffer: split into gso_size segments. All segments
+             * share one peer/flow, so the source address is the same. */
+            const int total = s->buf.len;
+            const int seg = s->gso_size;
+            for (int off = 0; off < total && !IS_SIG(top); off += seg)
+            {
+                int this_len = total - off;
+                if (this_len > seg)
+                {
+                    this_len = seg;
+                }
+                top->c2.buf = s->buf;
+                top->c2.buf.offset = s->buf.offset + off;
+                top->c2.buf.len = this_len;
+                top->c2.from = s->from;
+                multi_process_one_packet(m, mpp_flags);
+            }
+        }
+        else
+        {
+            top->c2.buf = s->buf;
+            top->c2.from = s->from;
+            multi_process_one_packet(m, mpp_flags);
+        }
+    }
+}
+#endif /* TARGET_LINUX */
+
 /*
  * Process an I/O event.
  */
@@ -225,10 +339,19 @@ multi_process_io_udp(struct multi_context *m)
     /* Incoming data on UDP port */
     else if (status & SOCKET_READ)
     {
-        read_incoming_link(&m->top);
-        if (!IS_SIG(&m->top))
+#if defined(TARGET_LINUX)
+        if (m->top.options.udp_batch_rx > 0)
         {
-            multi_process_incoming_link(m, NULL, mpp_flags);
+            multi_process_io_udp_batch(m, mpp_flags);
+        }
+        else
+#endif
+        {
+            read_incoming_link(&m->top);
+            if (!IS_SIG(&m->top))
+            {
+                multi_process_incoming_link(m, NULL, mpp_flags);
+            }
         }
     }
     /* Incoming data on TUN device */

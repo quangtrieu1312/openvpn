@@ -3499,6 +3499,184 @@ link_socket_read_udp_posix(struct link_socket *sock,
     return buf->len;
 }
 
+#if defined(TARGET_LINUX)
+
+/*
+ * Experimental UDP RX batching (recvmmsg + UDP_GRO). Linux only.
+ */
+
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+
+/* maximum size of a single (possibly GRO-coalesced) received message */
+#define UDP_BATCH_GRO_MAX 65536
+
+struct udp_batch *
+udp_batch_alloc(int n, const struct frame *frame)
+{
+    if (n <= 0 || !frame)
+    {
+        return NULL;
+    }
+    if (n > 1024)
+    {
+        n = 1024;
+    }
+
+    struct udp_batch *b;
+    ALLOC_OBJ_CLEAR(b, struct udp_batch);
+    b->n = n;
+    b->headroom = FRAME_HEADROOM_ADJ(frame, FRAME_HEADROOM_MARKER_READ_LINK);
+    ALLOC_ARRAY_CLEAR(b->slots, struct udp_batch_slot, n);
+    ALLOC_ARRAY_CLEAR(b->hdrs, struct mmsghdr, n);
+
+    /* each slot must be large enough to hold a GRO super-buffer */
+    const size_t slot_size = (size_t) b->headroom + UDP_BATCH_GRO_MAX + 512;
+    for (int i = 0; i < n; ++i)
+    {
+        b->slots[i].buf = alloc_buf(slot_size);
+    }
+    return b;
+}
+
+void
+udp_batch_free(struct udp_batch *b)
+{
+    if (!b)
+    {
+        return;
+    }
+    for (int i = 0; i < b->n; ++i)
+    {
+        free_buf(&b->slots[i].buf);
+    }
+    free(b->slots);
+    free(b->hdrs);
+    free(b);
+}
+
+static void
+udp_batch_enable_gro(struct link_socket *sock, struct udp_batch *b)
+{
+    b->gro_tried = true;
+    int on = 1;
+    if (setsockopt(sock->sd, SOL_UDP, UDP_GRO, (void *) &on, sizeof(on)) == 0)
+    {
+        b->gro_ok = true;
+        msg(D_HANDSHAKE, "UDP batch RX: UDP_GRO enabled");
+    }
+    else
+    {
+        b->gro_ok = false;
+        msg(M_WARN, "UDP batch RX: UDP_GRO not available (%s); "
+            "falling back to recvmmsg without GRO", strerror(errno));
+    }
+}
+
+int
+link_socket_read_udp_posix_recvmmsg(struct link_socket *sock,
+                                    struct udp_batch *b)
+{
+    ASSERT(sock->sd >= 0);
+
+    if (!b->gro_tried)
+    {
+        udp_batch_enable_gro(sock, b);
+    }
+
+    /* (re)initialize the slots and mmsghdr vector for this drain */
+    for (int i = 0; i < b->n; ++i)
+    {
+        struct udp_batch_slot *s = &b->slots[i];
+        struct mmsghdr *mm = &b->hdrs[i];
+
+        ASSERT(buf_init(&s->buf, b->headroom));
+        s->gso_size = 0;
+        addr_zero_host(&s->from.dest);
+
+        s->iov.iov_base = BPTR(&s->buf);
+        s->iov.iov_len = buf_forward_capacity_total(&s->buf);
+
+        memset(mm, 0, sizeof(*mm));
+        mm->msg_hdr.msg_iov = &s->iov;
+        mm->msg_hdr.msg_iovlen = 1;
+        mm->msg_hdr.msg_name = &s->from.dest.addr;
+        mm->msg_hdr.msg_namelen = sizeof(s->from.dest.addr);
+        mm->msg_hdr.msg_control = s->ctrl;
+        mm->msg_hdr.msg_controllen = sizeof(s->ctrl);
+    }
+
+    int k = recvmmsg(sock->sd, b->hdrs, b->n, MSG_DONTWAIT, NULL);
+    if (k < 0)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            return 0;
+        }
+        return -1;
+    }
+
+    for (int i = 0; i < k; ++i)
+    {
+        struct udp_batch_slot *s = &b->slots[i];
+        struct msghdr *mh = &b->hdrs[i].msg_hdr;
+
+        s->buf.len = (int) b->hdrs[i].msg_len;
+
+        /* parse ancillary data: destination addr (IP_PKTINFO / IPV6_PKTINFO,
+         * for multihome) and the GRO segment size (UDP_GRO). With GRO there can
+         * be more than one cmsg, so iterate them all. */
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(mh);
+             cmsg != NULL;
+             cmsg = CMSG_NXTHDR(mh, cmsg))
+        {
+#if defined(HAVE_IN_PKTINFO) && defined(HAVE_IPI_SPEC_DST)
+            if (cmsg->cmsg_level == SOL_IP
+                && cmsg->cmsg_type == IP_PKTINFO
+                && cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo)))
+            {
+                struct in_pktinfo *pkti = (struct in_pktinfo *) CMSG_DATA(cmsg);
+                s->from.pi.in4.ipi_ifindex = pkti->ipi_ifindex;
+                s->from.pi.in4.ipi_spec_dst = pkti->ipi_spec_dst;
+            }
+            else
+#elif defined(IP_RECVDSTADDR)
+            if (cmsg->cmsg_level == IPPROTO_IP
+                && cmsg->cmsg_type == IP_RECVDSTADDR
+                && cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_addr)))
+            {
+                s->from.pi.in4 = *(struct in_addr *) CMSG_DATA(cmsg);
+            }
+            else
+#endif
+            if (cmsg->cmsg_level == IPPROTO_IPV6
+                && cmsg->cmsg_type == IPV6_PKTINFO
+                && cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo)))
+            {
+                struct in6_pktinfo *pkti6 = (struct in6_pktinfo *) CMSG_DATA(cmsg);
+                s->from.pi.in6.ipi6_ifindex = pkti6->ipi6_ifindex;
+                s->from.pi.in6.ipi6_addr = pkti6->ipi6_addr;
+            }
+            else if (cmsg->cmsg_level == SOL_UDP
+                     && cmsg->cmsg_type == UDP_GRO
+                     && cmsg->cmsg_len >= CMSG_LEN(sizeof(int)))
+            {
+                int gso = 0;
+                memcpy(&gso, CMSG_DATA(cmsg), sizeof(gso));
+                s->gso_size = gso;
+            }
+        }
+    }
+
+    return k;
+}
+
+#endif /* TARGET_LINUX */
+
 #endif /* ifndef _WIN32 */
 
 /*

@@ -750,6 +750,10 @@ multi_uninit(struct multi_context *m)
             multi_reap_free(m->reaper);
             mroute_helper_free(m->route_helper);
             multi_tcp_free(m->mtcp);
+#if defined(TARGET_LINUX)
+            udp_batch_free(m->udp_batch);
+            m->udp_batch = NULL;
+#endif
             m->thread_mode = MC_UNDEF;
         }
     }

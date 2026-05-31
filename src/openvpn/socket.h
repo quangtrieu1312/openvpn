@@ -1043,6 +1043,50 @@ int link_socket_read_udp_posix(struct link_socket *sock,
                                struct buffer *buf,
                                struct link_socket_actual *from);
 
+#if defined(TARGET_LINUX)
+/*
+ * Experimental Linux UDP RX batching: read many datagrams per syscall with
+ * recvmmsg(), and optionally let the kernel coalesce same-flow datagrams into
+ * larger super-buffers with UDP_GRO (split back into segments on receive).
+ * On-the-wire format is unchanged; this is a purely local server-side RX
+ * optimization. See docs/udp-batching/.
+ */
+#define HAVE_UDP_BATCH_RX 1
+
+struct udp_batch_slot
+{
+    struct buffer buf;              /* slot payload, own backing storage */
+    struct link_socket_actual from; /* per-datagram source address */
+    struct iovec iov;              /* persistent iovec for this slot's mmsghdr */
+    uint8_t ctrl[256];             /* cmsg space: IP(V6)_PKTINFO + UDP_GRO */
+    int gso_size;                  /* >0 if GRO-coalesced super-buffer, else 0 */
+};
+
+struct udp_batch
+{
+    int n;                         /* number of slots */
+    int headroom;                  /* buf_init headroom (from frame) */
+    bool gro_tried;                /* lazy UDP_GRO setsockopt attempted */
+    bool gro_ok;                   /* UDP_GRO active on the socket */
+    struct udp_batch_slot *slots;
+    struct mmsghdr *hdrs;
+};
+
+struct frame;
+
+struct udp_batch *udp_batch_alloc(int n, const struct frame *frame);
+
+void udp_batch_free(struct udp_batch *b);
+
+/*
+ * Read up to b->n datagrams from the UDP socket in a single recvmmsg() call.
+ * Returns the number of datagrams read (>=0), 0 on EAGAIN, or -1 on error.
+ * For each returned slot, buf.len, from, and gso_size are filled in.
+ */
+int link_socket_read_udp_posix_recvmmsg(struct link_socket *sock,
+                                        struct udp_batch *b);
+#endif /* TARGET_LINUX */
+
 #endif
 
 /* read a TCP or UDP packet from link */
