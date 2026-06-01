@@ -45,8 +45,9 @@ openvpn --config server.conf --udp-batch-rx 32 --udp-batch-tx 32
 
 ## Benchmark environment
 
-5 VMs on a flat L2 (OpenStack, jumbo MTU 9000), **Alpine 3.22 / kernel 6.12**
-(so **no DCO** — all traffic goes through the userspace datapath under test):
+5 VMs on a flat L2 (OpenStack, jumbo-capable underlay; **eth0 pinned per run to
+MTU 9000 and 1500**), **Alpine 3.22 / kernel 6.12** (so **no DCO** — all traffic
+goes through the userspace datapath under test):
 
 | role | host | notes |
 |------|------|-------|
@@ -89,50 +90,76 @@ per-packet efficiency gain.
 
 ## Results
 
-Sanity — **DIRECT, no VPN** (TCP, `-P 8`): 1c **22.0 / 21.7 Gbit/s** up/down,
-2c ~20 Gbit/s each — the link is ~20 Gbit/s, so the VPN, not the testbed, is the
-limit.
+Server **stock v2.5.11** vs **batch** (`--udp-batch-rx 32 --udp-batch-tx 32`),
+at two underlay MTUs: **9000** (jumbo, unfragmented encapsulation) and **1500**
+(the common case — the ~1.5 KB encapsulated datagram is IP-fragmented on the wire).
+iperf3 `-P 8 -t 15`; server CPU sampled ~9 s mid-run (one core = 100%; see note
+above). Single run per cell on shared cloud VMs (±noise). Rerun 2026-06-01; raw data
+in [`docs/udp-batching/BENCH-RERUN-2026-06-01.tsv`](docs/udp-batching/BENCH-RERUN-2026-06-01.tsv).
+Clients are stock OpenVPN 2.6.20 (apk) in both columns — only the **server** binary
+changes. Sanity — DIRECT, no VPN (TCP, `-P 8`): ~20 Gbit/s, so the VPN, not the
+testbed, is the limit.
 
 ### TCP throughput (Mbit/s, sum of 8 streams) + server CPU%
 
-Server openvpn process at ~90–93% of **one core** in both stock and batch (the
-single-threaded ceiling is 100%) → a fair, CPU-bound comparison.
+UP = client→target = server **RX** (recvmmsg+GRO). DOWN (`-R`) = server **TX**
+(sendmmsg+GSO). 2-client rows are the **A+B sum**; mixed = A-up + B-down at once
+(shared CPU sample).
 
-| scenario (UP=RX, DOWN=TX) | stock | cpu | batch | cpu | Δ |
-|---------------------------|------:|----:|------:|----:|----:|
-| 1-client UP               |   367 | 90% |   491 | 73% | **+34%** |
-| 1-client DOWN             |   387 | 92% |   602 | 92% | **+56%** |
-| 2-client UP (A+B)         |   353 | 92% |   764 | 93% | **+116%** |
-| 2-client DOWN (A+B)       |   355 | 92% |   650 | 93% | **+83%** |
-| mixed UP                  |   215 | 92% |   426 | 92% | **+98%** |
-| mixed DOWN                |   156 | 92% |   175 | 92% | +12% |
+**MTU 9000 (jumbo / unfragmented)**
 
-Notable: 1-client UP reaches 491 Mbit/s at only **73%** of one core (vs stock 367
-@ 90%) — batching does the same work for less CPU; the 2-client cases (server
-near-saturated at ~one core)
-roughly **double** throughput.
+| scenario      | stock | cpu | batch | cpu |     Δ |
+|---------------|------:|----:|------:|----:|------:|
+| 1-client UP   |   359 | 87% |   445 | 71% |  +24% |
+| 1-client DOWN |   397 | 91% |   747 | 91% |  +88% |
+| 2-client UP   |   389 | 92% |   514 | 84% |  +32% |
+| 2-client DOWN |   472 | 93% |   945 | 95% | +100% |
+| mixed UP      |   220 | 92% |   276 | 94% |  +25% |
+| mixed DOWN    |   187 | 92% |   439 | 94% | +135% |
 
-### UDP loss @ `-b 3000M` offered (lower = better)
+**MTU 1500 (fragmented encapsulation)**
 
-UDP was driven far above capacity to stress the datapath; the table reports
-**packet loss** (clean UDP goodput was not captured this run — see caveat). Batch
-generally drops fewer packets for the same offered load:
+| scenario      | stock | cpu | batch | cpu |     Δ |
+|---------------|------:|----:|------:|----:|------:|
+| 1-client UP   |   345 | 88% |   365 | 78% |   +6% |
+| 1-client DOWN |   414 | 92% |   716 | 93% |  +73% |
+| 2-client UP   |   388 | 92% |   503 | 85% |  +30% |
+| 2-client DOWN |   510 | 92% |   742 | 95% |  +45% |
+| mixed UP      |   238 | 92% |   311 | 95% |  +31% |
+| mixed DOWN    |   174 | 92% |   443 | 95% | +155% |
 
-| scenario | stock loss | batch loss |
-|----------|-----------:|-----------:|
-| 1-client UP   | 88% | 79% |
-| 1-client DOWN | 70% | 57% |
-| 2-client DOWN | 83% / 83% | 75% / 74% |
+Headline: **TX batching (DOWN) is the big win and holds at both MTUs** — +73–100%
+on 1/2-client downloads and +135–155% on the mixed download, only modestly smaller
+at 1500 than at 9000. RX batching (UP) helps most when the server is CPU-bound with
+multiple flows (+24–32%); the weakest cell is 1500 1-client UP (+6%), where the
+server isn't RX-saturated — note batch still uses **less** CPU there (78% vs 88%),
+i.e. it returns headroom rather than throughput. Several batch cells deliver more
+throughput at **equal-or-lower CPU** (e.g. 9000 1-up 445 @71% vs 359 @87%) — a real
+per-packet efficiency gain.
+
+### UDP under overload (`-b 3000M` offered) — download/TX goodput (Mbit/s recv) / loss
+
+Driven far above capacity to stress the datapath. Download (server TX) is the clean
+signal — goodput rises and loss falls with batching at **both** MTUs:
+
+| scenario (DOWN/TX) | MTU  | stock goodput / loss | batch goodput / loss |
+|--------------------|-----:|---------------------:|---------------------:|
+| 1-client DOWN      | 9000 | 695 / 67%            | 921 / 59%            |
+| 2-client DOWN      | 9000 | 685 / 68%            | 953 / 58%            |
+| 1-client DOWN      | 1500 | 667 / 70%            | 969 / 57%            |
+| 2-client DOWN      | 1500 | 643 / 71%            | 921 / 59%            |
 
 ### Summary
 
 Both directions of the non-DCO userspace datapath are batched and measured on a
-CPU-saturated single-threaded server: **TCP +34–116%** (largest with multiple
-clients / both directions busy), with the server doing equal-or-less CPU per unit
-throughput; UDP shows lower loss under overload. No decrypt/replay errors;
-stock-client interop intact.
+CPU-saturated single-threaded server, now at **both MTU 9000 and 1500**: TX batching
+gives the largest, MTU-robust gains (**+45–100%** on downloads, up to +155% mixed),
+RX batching adds **+24–32%** when multi-flow CPU-bound — with the server doing
+equal-or-less CPU per unit throughput. UDP TX goodput is higher and loss lower under
+overload at both MTUs. No decrypt/replay errors; stock-client interop intact.
 
-**Caveats (honesty):** numbers are a single run on shared cloud VMs (±noise); the
-UDP rows report loss only (the harness parsed the loss field, not goodput, for UDP
-receiver lines); one CPU sample misfired (read 0% — a mid-run 9 s snapshot, not a
-full-run average). The TCP matrix with CPU% is the reliable result.
+**Caveats (honesty):** single run per cell on shared cloud VMs (±noise); one CPU
+sample (~9 s mid-run, not a full-run average). The **TCP matrices are the reliable
+result**; UDP is supplementary — a few aggregate UDP cells didn't parse under heavy
+overload, so UDP UP rows are omitted. Server stock = pristine 2.5.11; batch = the
+2.5.11 fork; clients = stock 2.6.20 throughout.
